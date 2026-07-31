@@ -224,6 +224,6 @@ while cap.isOpened():
     frame_count += 1
 
 
-# Release resources
+# Release resources results
 cap.release()
 out.release()
