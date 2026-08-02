@@ -1,194 +1,338 @@
+# ============================================================
+# Railway Platform Safety Monitoring System
+# Advanced YOLO + Line Geometry + Risk Analysis
+# Part 1/3
+# ============================================================
+
 import cv2
 import numpy as np
+import time
 from ultralytics import YOLO
+from collections import defaultdict, deque
 
-# -----------------------------
-# Load Models
-# -----------------------------
-line_model = YOLO("/kaggle/input/subway-yellow-safety-line-detection/pytorch/default/1/Line_detection_weights (best).pt")
-person_model = YOLO("/kaggle/input/people-detection-model/pytorch/default/1/People_detection_weights(best).pt")
 
-# -----------------------------
-# Video
-# -----------------------------
-video_path = "/kaggle/input/cctv-video-footage/BB_cff64429-bafc-4258-bdbe-6bba7270af6c_preview.mp4"
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
-cap = cv2.VideoCapture(video_path)
-
-fps = cap.get(cv2.CAP_PROP_FPS)
-width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-out = cv2.VideoWriter(
-    "/kaggle/working/output.mp4",
-    cv2.VideoWriter_fourcc(*"mp4v"),
-    fps,
-    (width, height)
+VIDEO_PATH = (
+    "/kaggle/input/cctv-video-footage/"
+    "BB_cff64429-bafc-4258-bdbe-6bba7270af6c_preview.mp4"
 )
 
-# -----------------------------
-# Helper Functions
-# -----------------------------
-def detect_yellow_line(frame, bbox):
-    x1, y1, x2, y2 = bbox
+OUTPUT_PATH = "/kaggle/working/railway_safety_output.mp4"
 
-    roi = frame[y1:y2, x1:x2]
 
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+LINE_MODEL_PATH = (
+    "/kaggle/input/subway-yellow-safety-line-detection/"
+    "pytorch/default/1/Line_detection_weights (best).pt"
+)
 
-    lower = np.array([15, 60, 100])
-    upper = np.array([40, 255, 255])
+PERSON_MODEL_PATH = (
+    "/kaggle/input/people-detection-model/"
+    "pytorch/default/1/People_detection_weights(best).pt"
+)
 
-    mask = cv2.inRange(hsv, lower, upper)
 
-    lines = cv2.HoughLinesP(
-        mask,
-        1,
-        np.pi / 180,
-        50,
-        minLineLength=100,
-        maxLineGap=10
-    )
+# Risk thresholds in pixels
+SAFE_DISTANCE = 120
+WARNING_DISTANCE = 70
+DANGER_DISTANCE = 30
 
-    if lines is None:
-        return None
 
-    x_positions = []
+# Number of frames required before alarm
+DANGER_CONFIRM_FRAMES = 5
 
-    for line in lines:
-        xa, ya, xb, yb = line[0]
+
+# ============================================================
+# LOAD MODELS
+# ============================================================
+
+print("Loading models...")
+
+line_model = YOLO(LINE_MODEL_PATH)
+
+person_model = YOLO(PERSON_MODEL_PATH)
+
+
+print("Models loaded successfully")
+
+
+# ============================================================
+# SAFETY LINE DETECTOR
+# ============================================================
+
+class SafetyLineDetector:
+
+    def __init__(self):
+
+        self.previous_line = None
+
+
+    def extract_yellow_pixels(self, frame, bbox):
+
+        """
+        Extract yellow safety line pixels
+        inside platform bounding box
+        """
+
+        if bbox is None:
+            return None
+
+
+        x1, y1, x2, y2 = bbox
+
+
+        roi = frame[y1:y2, x1:x2]
+
+
+        if roi.size == 0:
+            return None
+
+
+        hsv = cv2.cvtColor(
+            roi,
+            cv2.COLOR_BGR2HSV
+        )
+
+
+        lower_yellow = np.array(
+            [15, 50, 80]
+        )
+
+        upper_yellow = np.array(
+            [45, 255, 255]
+        )
+
+
+        mask = cv2.inRange(
+            hsv,
+            lower_yellow,
+            upper_yellow
+        )
+
+
+        points = cv2.findNonZero(mask)
+
+
+        if points is None:
+            return None
+
+
+        points = points.reshape(-1,2)
+
+
+        # Convert ROI coordinates to frame coordinates
+
+        points[:,0] += x1
+        points[:,1] += y1
+
+
+        return points
+
+
+
+    def fit_line(self, points):
+
+        """
+        Fit a single mathematical line
+        using all yellow pixels
+        """
+
+        if points is None:
+            return self.previous_line
+
+
+        if len(points) < 20:
+            return self.previous_line
+
+
+        vx,vy,x,y = cv2.fitLine(
+            points.astype(np.float32),
+            cv2.DIST_L2,
+            0,
+            0.01,
+            0.01
+        )
+
+
+        line = (
+            float(vx),
+            float(vy),
+            float(x),
+            float(y)
+        )
+
+
+        self.previous_line = line
+
+
+        return line
+
+
+
+    def draw_line(self, frame, line):
+
+        """
+        Draw fitted safety line
+        """
+
+        if line is None:
+            return
+
+
+        vx,vy,x,y = line
+
+
+        length = 2000
+
+
+        x1 = int(x - vx*length)
+        y1 = int(y - vy*length)
+
+        x2 = int(x + vx*length)
+        y2 = int(y + vy*length)
+
 
         cv2.line(
             frame,
-            (xa + x1, ya + y1),
-            (xb + x1, yb + y1),
-            (0, 255, 0),
-            2
+            (x1,y1),
+            (x2,y2),
+            (0,255,0),
+            3
         )
 
-        x_positions.append((xa + xb) / 2 + x1)
-
-    return int(np.mean(x_positions))
 
 
-def foot_point(box):
-    x1, y1, x2, y2 = box
-    return int((x1 + x2) / 2), int(y2)
+# ============================================================
+# GEOMETRY FUNCTIONS
+# ============================================================
+
+def point_line_distance(point, line):
+
+    """
+    Calculate perpendicular distance
+    from point to fitted line
+    """
+
+    if line is None:
+        return 9999
 
 
-# -----------------------------
-# Main Loop
-# -----------------------------
-while cap.isOpened():
+    vx,vy,x0,y0 = line
 
-    ret, frame = cap.read()
 
-    if not ret:
-        break
+    px,py = point
 
-    railway_x = None
-    yellow_x = None
 
-    # -------------------------
-    # Detect railway & platform
-    # -------------------------
-    results = line_model(frame)[0]
-
-    platform_box = None
-
-    for box in results.boxes.data.tolist():
-
-        x1, y1, x2, y2, conf, cls = box
-
-        name = line_model.names[int(cls)]
-
-        if name == "Railway track":
-            railway_x = int((x1 + x2) / 2)
-
-        elif name == "stopbraille-blocks":
-            platform_box = list(map(int, [x1, y1, x2, y2]))
-
-    if platform_box is not None:
-        yellow_x = detect_yellow_line(frame, platform_box)
-
-    railway_left = None
-
-    if railway_x is not None and yellow_x is not None:
-        railway_left = railway_x < yellow_x
-
-    # -------------------------
-    # Detect People
-    # -------------------------
-    people = person_model(frame)[0]
-
-    danger_count = 0
-
-    for box in people.boxes.data.tolist():
-
-        x1, y1, x2, y2, conf, cls = box
-
-        if person_model.names[int(cls)] != "Person":
-            continue
-
-        bbox = list(map(int, [x1, y1, x2, y2]))
-
-        fx, fy = foot_point(bbox)
-
-        color = (0, 255, 0)
-
-        if railway_left is not None:
-
-            if railway_left and fx < yellow_x:
-                color = (0, 0, 255)
-                danger_count += 1
-
-            elif not railway_left and fx > yellow_x:
-                color = (0, 0, 255)
-                danger_count += 1
-
-        cv2.rectangle(
-            frame,
-            (bbox[0], bbox[1]),
-            (bbox[2], bbox[3]),
-            color,
-            2
-        )
-
-        cv2.circle(frame, (fx, fy), 5, color, -1)
-
-    # -------------------------
-    # Danger Counter
-    # -------------------------
-    overlay = frame.copy()
-
-    status_color = (0, 255, 0)
-
-    if danger_count > 0:
-        status_color = (0, 0, 255)
-
-    cv2.rectangle(
-        overlay,
-        (width - 220, 20),
-        (width - 20, 90),
-        status_color,
-        -1
+    numerator = abs(
+        vy*(px-x0)
+        -
+        vx*(py-y0)
     )
 
-    cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
 
-    cv2.putText(
-        frame,
-        f"Danger: {danger_count}",
-        (width - 205, 65),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.8,
-        (255, 255, 255),
-        2
+    denominator = np.sqrt(
+        vx*vx + vy*vy
     )
 
-    out.write(frame)
 
-cap.release()
-out.release()
+    return numerator / denominator
 
-print("Processing completed.")
+
+
+def point_side(point,line):
+
+    """
+    Determines which side of line
+    a point belongs to
+    """
+
+    if line is None:
+        return 0
+
+
+    vx,vy,x0,y0=line
+
+
+    px,py=point
+
+
+    value = (
+        vx*(py-y0)
+        -
+        vy*(px-x0)
+    )
+
+
+    if value > 0:
+        return 1
+
+    else:
+        return -1
+
+
+
+# ============================================================
+# FOOT POSITION
+# ============================================================
+
+def get_foot_position(box):
+
+    x1,y1,x2,y2 = box
+
+
+    return (
+        int((x1+x2)/2),
+        int(y2)
+    )
+
+
+
+# ============================================================
+# RISK CLASSIFICATION
+# ============================================================
+
+def calculate_risk(distance):
+
+
+    if distance > SAFE_DISTANCE:
+
+        return "SAFE", (0,255,0)
+
+
+
+    elif distance > WARNING_DISTANCE:
+
+        return "WARNING",(0,255,255)
+
+
+
+    elif distance > DANGER_DISTANCE:
+
+        return "HIGH RISK",(0,165,255)
+
+
+
+    else:
+
+        return "DANGER",(0,0,255)
+
+
+
+# ============================================================
+# INITIALIZE
+# ============================================================
+
+safety_detector = SafetyLineDetector()
+
+
+person_history = defaultdict(
+    lambda: deque(maxlen=20)
+)
+
+
+danger_counter = defaultdict(int)
+
+
+print("Part 1 loaded successfully")
